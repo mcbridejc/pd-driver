@@ -100,14 +100,7 @@ const APP: () = {
 
     #[idle(resources=[uart, uart_tx_producer, uart_rx_consumer])]
     fn idle(mut cx: idle::Context) -> ! {
-        static mut X: u32 = 0;
-
-        // Safe access to local `static mut` variable
-        let _x: &'static mut u32 = X;
-
         hprintln!("Still here").unwrap();
-
-        //debug::exit(debug::EXIT_SUCCESS);
 
         loop {
             match cx.resources.uart_rx_consumer.dequeue() {
@@ -122,7 +115,6 @@ const APP: () = {
         }
     }
 
-    // `shared` can be accessed from this context
     #[task(binds = USART3, resources = [uart, uart_rx_producer, uart_tx_consumer])]
     fn uart3(cx: uart3::Context) {
 
@@ -139,80 +131,5 @@ const APP: () = {
                 None => cx.resources.uart.unlisten(hal::serial::Event::Txe),
             }
         }
-
-        hprintln!("UART2").unwrap(); //: shared = {}", shared).unwrap();
     }
 };
-
-
-// #[entry]
-// fn main() -> ! {
-//     asm::nop(); // To not have main optimize to abort in release mode, remove when you add code
-
-//     let mut peripherals = Peripherals::take().unwrap();
-//     let mut systick = peripherals.SYST;
-//     systick.set_clock_source(syst::SystClkSource::Core);
-//     systick.set_reload(1_000);
-//     systick.clear_current();
-//     systick.enable_counter();
-
-//     hprintln!("Here we go...").unwrap();
-//     let pac_periphs = PacPeripherals::take().unwrap();
-//     let mut pins = pac_periphs.PORT.split();
-//     let mut red_led = pins.pa23.into_open_drain_output(&mut pins.port);
-
-//     //let redLed = hal::gpio::Parts::Pa23.into_push_pull_output();
-//     //let mut port = samperiphs.PORT;
-
-
-//     // port.dir0.write(|w| unsafe {w.bits((1<<23))});
-//     // port.out0.write(|w| unsafe {w.bits((1<<23))});
-//     // while !systick.has_wrapped() {
-//     //     // Loop
-//     // }
-
-//     loop {
-//         // for _ in 0..10000000 {
-//         //     asm::nop();
-//         //     asm::nop();
-//         //     asm::nop();
-//         // }
-//         //port.out0.write(|w| unsafe {w.bits((1<<23))});
-//         // for _ in 0..10000000 {
-//         //     asm::nop();
-//         //     asm::nop();
-//         //     asm::nop();
-//         // }
-//         //port.out0.write(|w| unsafe {w.bits(0)});
-
-//         // your code goes here
-//     }
-// }
-
-
-// #[cfg(test)]
-// fn test_runner(tests: &[&dyn Fn()]) {
-//     println!("Running {} tests", tests.len());
-//     for test in tests {
-//         test();
-//     }
-// }
-
-
-// #[no_mangle]
-// pub extern "C" fn _start() -> ! {
-//     hprintln!("Hello World{}", "!");
-
-//     #[cfg(test)]
-//     test_main();
-
-//     loop {}
-// }
-
-// #[cfg(test)]
-// mod tests {
-//     #[test_case]
-//     fn test_cb_write() {
-//         assert_eq!(1, 0);
-//     }
-// }
