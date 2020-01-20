@@ -10,4 +10,4 @@ You can program and debug with the ST-LINK built into the Nucleo board using ope
 
 ## Local Documentation
 
-`cargo doc --open`
+`cargo doc --open` is useful. 
