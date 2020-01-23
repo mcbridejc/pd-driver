@@ -4,49 +4,41 @@
 #![feature(custom_test_frameworks)]
 #![reexport_test_harness_main = "test_main"]
 
-#![feature(alloc)]
+//#![feature(alloc)]
 #![feature(alloc_error_handler)]
-
 #![test_runner(crate::test_runner)]
 
 // pick a panicking behavior
-extern crate panic_halt; // you can put a breakpoint on `rust_begin_unwind` to catch panics
+// extern crate panic_halt; // you can put a breakpoint on `rust_begin_unwind` to catch panics
 // extern crate panic_abort; // requires nightly
-// extern crate panic_itm; // logs messages over ITM; requires ITM support
-// extern crate panic_semihosting; // logs messages to the host stderr; requires a debugger
+extern crate panic_itm; // logs messages over ITM; requires ITM support
+//extern crate panic_semihosting; // logs messages to the host stderr; requires a debugger
 
-//use panic_semihosting as _;
-
-//use cortex_m::asm;
-//use cortex_m::peripheral::{syst, Peripherals};
+use cortex_m::{iprintln};
 use rtfm;
-use rtfm::cyccnt::{Instant, U32Ext as _};
+use rtfm::cyccnt::{U32Ext as _};
 use alloc_cortex_m::CortexMHeap;
 extern crate alloc;
 use self::alloc::vec::Vec;
-use core::cell::RefCell;
 use core::alloc::Layout;
-use cortex_m_semihosting::hprintln;
-use cortex_m::asm;
+use core::fmt::Write;
+use cortex_m::{asm};
 use stm32f4xx_hal as hal;
 use stm32f4::stm32f411 as target_device;
 use target_device::Interrupt;
 
 use hal::prelude::*;
 use embedded_hal::digital::v2::{OutputPin};
+use embedded_hal::adc::{OneShot, Channel};
 use stm32f4xx_hal::gpio::{gpioa, gpiob, gpioc, gpiod, Output, PushPull, Analog, Alternate, AF5, AF7};
 use stm32f4xx_hal::spi;
 use stm32f4xx_hal::adc;
 use heapless::{
-    consts::*,
     i,
     spsc::{Consumer, Producer, Queue},
 };
 
 use typenum::consts::U512;
-
-mod hv507;
-use hv507::Hv507;
 
 use pd_driver_messages::{
     Parser,
@@ -54,68 +46,51 @@ use pd_driver_messages::{
     messages::*
 };
 
-/// Error type combining SPI, I2C, and Pin errors
-/// You can remove anything you don't need / add anything you do
-/// (as well as additional driver-specific values) here
-// #[derive(Debug, Clone, PartialEq)]
-// pub enum Error<PinError> {
-//     /// Underlying GPIO pin error
-//     Pin(PinError),
-// }
-
-// pub struct PdDriver<PolPin, ResetPin, PinError> 
-// where 
-//     PolPin: OutputPin,
-//     ResetPin: OutputPin
-// {
-//     pol: PolPin,
-//     reset: ResetPin,
-    
-//     pub(crate) err: Option<Error<PinError>>,
-// }
-
-// impl<PolPin, ResetPin, PinError> PdDriver<PolPin, ResetPin, PinError>
-// where 
-//     PolPin: OutputPin<Error = PinError>,
-//     ResetPin: OutputPin<Error = PinError>
-// {
-//     pub fn new(pol: PolPin, reset: ResetPin) -> PdDriver<PolPin, ResetPin, PinError> {
-//         PdDriver{pol, reset, err: None}
-//     }
-// }
-
-// this is the allocator the application will use
+// Create an allocator for heap usage
 #[global_allocator]
 static ALLOCATOR: CortexMHeap = CortexMHeap::empty();
 const HEAP_SIZE: usize = 8192; // in bytes
 
-//type PolPin = gpiob::PB11<StatefulOutputPin>;
+
+const BLANKING_DELAY_NS: u64 = 12000;
+const RESET_DELAY_NS: u64 = 1000;
+const SAMPLE_DELAY_NS: u64 = 2000;
+
+
+#[inline(always)]
+fn delay_ns(nanos: u64) {
+    const FCLK: u64 = 100_000_000;
+    let cycles = (nanos * FCLK + 999_999_999) / 1_000_000_000;
+    asm::delay(cycles as u32);
+}
 
 #[rtfm::app(device = stm32f4::stm32f411, peripherals = true, monotonic = rtfm::cyccnt::CYCCNT)]
 const APP: () = {
     struct Resources {
         // A resource
         //uart: hal::serial::Serial<hal::stm32::USART3, (gpiod::PD8<Alternate<AF7>>, gpiod::PD9<Alternate<AF7>>)>,
-        uart: hal::serial::Serial<hal::stm32::USART2, (gpioa::PA2<Alternate<AF7>>, gpioa::PA3<Alternate<AF7>>)>,
+        //uart: hal::serial::Serial<hal::stm32::USART2, (gpioa::PA2<Alternate<AF7>>, gpioa::PA3<Alternate<AF7>>)>,
+        uart: hal::serial::Serial<hal::stm32::USART1, (gpioa::PA9<Alternate<AF7>>, gpioa::PA10<Alternate<AF7>>)>,
         uart_rx_producer: Producer<'static, u8, U512>,
         uart_rx_consumer: Consumer<'static, u8, U512>,
         uart_tx_producer: Producer<'static, u8, U512>,
         uart_tx_consumer: Consumer<'static, u8, U512>,
-        driver: Hv507<
-            spi::Spi<hal::stm32::SPI1, (gpiob::PB3<Alternate<AF5>>, spi::NoMiso, gpiob::PB5<Alternate<AF5>>)>,
-            hal::adc::Adc<hal::stm32::ADC1>,
-            gpioa::PA0<Analog>,
-            gpioc::PC3<Output<PushPull>>,
-            gpioc::PC2<Output<PushPull>>,
-            gpiob::PB4<Output<PushPull>>,
-            gpiob::PB10<Output<PushPull>>,
-            (),
-        >,
+        bl_pin: gpioc::PC3<Output<PushPull>>,
+        pol_pin: gpioc::PC2<Output<PushPull>>,
+        le_pin: gpiob::PB4<Output<PushPull>>,
+        int_reset_pin: gpiob::PB10<Output<PushPull>>,
+        spi: spi::Spi<hal::stm32::SPI1, (gpioa::PA5<Alternate<AF5>>, spi::NoMiso, gpiob::PB5<Alternate<AF5>>)>,
+        adc: adc::Adc<hal::stm32::ADC1>,
+        adc_channel: gpioa::PA0<Analog>,
+        #[init(false)]
+        transfer_active: bool,
         parser: Parser,
+        debugio: gpioc::PC0<Output<PushPull>>,
     }
 
     #[init(schedule = [drive])]
     fn init(cx: init::Context) -> init::LateResources {
+
         static mut UART_RX_BUFFER: Queue<u8, U512> = Queue(i::Queue::new());
         static mut UART_TX_BUFFER: Queue<u8, U512> = Queue(i::Queue::new());
 
@@ -124,10 +99,13 @@ const APP: () = {
         let mut core: rtfm::Peripherals = cx.core;
 
         // Device specific peripherals
-        let mut device: target_device::Peripherals = cx.device;
+        let device: target_device::Peripherals = cx.device;
 
-        let mut rcc = device.RCC;
-        let mut flash = device.FLASH;
+
+        let stim = &mut core.ITM.stim[0];
+        iprintln!(stim, "Running");
+
+        let rcc = device.RCC;
 
         // Configure PLL settings to run at 100MHz sysclk
         let clocks = rcc.constrain().cfgr.sysclk(100.mhz()).freeze();
@@ -135,29 +113,30 @@ const APP: () = {
         // Initialize (enable) the monotonic timer (CYCCNT)
         core.DCB.enable_trace();
         core.DWT.enable_cycle_counter();
-        
-        let mut gpioa = device.GPIOA.split();
-        let mut gpiob = device.GPIOB.split();
-        let mut gpioc = device.GPIOC.split();
-        let mut gpiod = device.GPIOD.split();
-        let tx_pin = gpioa.pa2.into_alternate_af7();
-        let rx_pin = gpioa.pa3.into_alternate_af7();
-        let mut uart = hal::serial::Serial::usart2(
-            device.USART2,
+
+        let gpioa = device.GPIOA.split();
+        let gpiob = device.GPIOB.split();
+        let gpioc = device.GPIOC.split();
+        let gpiod = device.GPIOD.split();
+        let tx_pin = gpioa.pa9.into_alternate_af7();
+        let rx_pin = gpioa.pa10.into_alternate_af7();
+        let mut uart = hal::serial::Serial::usart1(
+            device.USART1,
             (tx_pin, rx_pin),
             hal::serial::config::Config::default().baudrate(230400.bps()),
             clocks,
         ).unwrap();
-        
+
         let (uart_rx_producer, uart_rx_consumer) = UART_RX_BUFFER.split();
         let (uart_tx_producer, uart_tx_consumer) = UART_TX_BUFFER.split();
 
-        let pol = gpioc.pc2.into_push_pull_output();
-        let bl = gpioc.pc3.into_push_pull_output();
-        let le = gpiob.pb4.into_push_pull_output();
-        let int_reset = gpiob.pb10.into_push_pull_output();
+        let debugio = gpioc.pc0.into_push_pull_output();
+        let pol_pin = gpioc.pc2.into_push_pull_output();
+        let bl_pin = gpioc.pc3.into_push_pull_output();
+        let le_pin = gpiob.pb4.into_push_pull_output();
+        let int_reset_pin = gpiob.pb10.into_push_pull_output();
         let mosi = gpiob.pb5.into_alternate_af5();
-        let sck = gpiob.pb3.into_alternate_af5();
+        let sck = gpioa.pa5.into_alternate_af5();
         let miso = hal::spi::NoMiso{};
         let spi = hal::spi::Spi::spi1(
             device.SPI1,
@@ -166,89 +145,112 @@ const APP: () = {
             8_000_000.hz(),
             clocks
         );
-        let adc_config = hal::adc::config::AdcConfig::default();
+        let adc_config = adc::config::AdcConfig::default();
+        adc_config.default_sample_time(adc::config::SampleTime::Cycles_3);
 
-        let adc = hal::adc::Adc.adc1(
+        let adc = adc::Adc::adc1(
             device.ADC1,
             true,
             adc_config,
         );
-        let adc_channel = gpioa::PA0::into_analog();
-        let driver = Hv507::new(spi, adc, adc_channel, bl, pol, le, int_reset);
-        //let driver = PdDriver::new( );
+        let adc_channel = gpioa.pa0.into_analog();
         let now = cx.start; // the start time of the system
         cx.schedule.drive(now + 100_000_000u32.cycles()).unwrap();
-        
-        //let mut systick = core.SYST;
-        // systick.set_clock_source(systick::SystClkSource::Core);
-        // systick.set_reload(1_000);
-        // systick.enable_counter();
 
         hal::block!(uart.write(52)).unwrap();
         hal::block!(uart.write(52)).unwrap();
         hal::block!(uart.write(52)).unwrap();
-        
+
         uart.listen(hal::serial::Event::Rxne);
-        
+
         let parser = Parser::new();
 
-        init::LateResources { uart, uart_rx_producer, uart_rx_consumer, uart_tx_producer, uart_tx_consumer, driver, parser}
+        init::LateResources {
+            uart,
+            uart_rx_producer,
+            uart_rx_consumer,
+            uart_tx_producer,
+            uart_tx_consumer,
+            bl_pin,
+            pol_pin,
+            le_pin,
+            int_reset_pin,
+            spi,
+            adc,
+            adc_channel,
+            parser,
+            debugio,
+        }
     }
 
-    #[task(resources = [driver, uart, uart_tx_producer], schedule=[drive])]
-    fn drive(mut cx: drive::Context) {
-        static mut state: bool = false;
 
-        let driver = cx.resources.driver;
-        if *state {
-            let (sample0, sample1) = driver.set_polarity_with_blank(true);
+    #[task(priority=3, resources = [transfer_active, bl_pin, pol_pin, le_pin, int_reset_pin, adc, adc_channel, uart, uart_tx_producer], schedule=[drive])]
+    fn drive(mut cx: drive::Context) {
+        static mut STATE: bool = false;
+
+        let bl_pin = cx.resources.bl_pin;
+        let pol_pin = cx.resources.pol_pin;
+        let le_pin = cx.resources.le_pin;
+        let int_reset_pin = cx.resources.int_reset_pin;
+        let adc = cx.resources.adc;
+        let adc_channel = cx.resources.adc_channel;
+
+        // Drive the HV507b polarity switching sequence
+        // On polarity rise, also measure the capacitance of the activated electrodes
+        // int_reset resets the analog integrator to a near-zero when driven high.
+        // When low, the integrator is free to integrate the current pulse.
+        if *STATE {
+            bl_pin.set_low().ok();
+            pol_pin.set_high().ok();
+            if !*cx.resources.transfer_active {
+                le_pin.set_low().ok();
+                delay_ns(80); // datasheet says 80ns min LE pulse width
+                le_pin.set_high().ok();
+            }
+
+            delay_ns(BLANKING_DELAY_NS);
+            int_reset_pin.set_low().ok();
+            delay_ns(RESET_DELAY_NS);
+            let sample0 = adc.read(adc_channel).unwrap();
+            //let sample0 = 0;
+            bl_pin.set_high().ok();
+            delay_ns(SAMPLE_DELAY_NS);
+            let sample1 = adc.read(adc_channel).unwrap();
+            int_reset_pin.set_high().ok();
+            //let sample1 = 100;
             let msg = ActiveCapacitanceStruct{baseline: sample0, measurement: sample1};
             let buf: Vec<u8> = msg.into();
             for b in serialize(ACTIVE_CAPACITANCE_ID, &buf) {
-                cx.resources.uart_tx_producer.enqueue(b).expect("rx Overflow");
+                match cx.resources.uart_tx_producer.enqueue(b) {
+                    Ok(_) => (),
+                    Err(_) => (),
+                }
             }
             // Enable the TXE interrupt
             cx.resources.uart.lock(|uart| {
                 uart.listen(hal::serial::Event::Txe);
             });
-            *state = false;
+            *STATE = false;
         } else {
-            driver.set_polarity(false);
-            *state = true;
+            pol_pin.set_low().ok();
+            *STATE = true;
         }
-
-
-
-        // let mut pol = &mut cx.resources.driver.pol;
-        // let mut reset = &mut cx.resources.driver.reset;
-        // if *state {
-        //     hprintln!("POL HIGH");
-        //     reset.set_low();
-        //     asm::delay(1000);
-        //     pol.set_high();
-        //     asm::delay(1000);
-        //     reset.set_high();
-        //     *state = false;
-        // } else {
-        //     hprintln!("POL LOW");
-        //     pol.set_low();
-        //     *state = true;
-        // }
 
         // Run every 1ms
         cx.schedule.drive(cx.scheduled + 100_000u32.cycles()).unwrap();
     }
 
+    /// The idle task handles parsing of incoming messages
     #[idle(resources=[uart_rx_consumer, parser], spawn = [update_active_electrodes])]
-    fn idle(mut cx: idle::Context) -> ! {
-        let mut parser = cx.resources.parser;
+    fn idle(cx: idle::Context) -> ! {
+        let parser = cx.resources.parser;
         loop {
             match cx.resources.uart_rx_consumer.dequeue() {
                 Some(x) => {
                     if let Some(msg) = parser.parse(x) {
                         match msg {
                             Message::ElectrodeEnableMsg(msg) => {
-                                cx.spawn.update_active_electrodes(msg);
+                                cx.spawn.update_active_electrodes(msg).unwrap();
                             },
                             _ => (),
                         }
@@ -259,21 +261,34 @@ const APP: () = {
         }
     }
 
-    #[task(resources=[driver])]
+    // Write new value to the HV507 shift register
+    // It is not latched until the next polarity rise event
+    #[task(priority=2, resources=[transfer_active, spi])]
     fn update_active_electrodes(mut cx: update_active_electrodes::Context, msg: ElectrodeEnableStruct) {
-        let driver = cx.resources.driver;
-        driver.update_sr(&msg.values);
+        cx.resources.transfer_active.lock(|flag| {
+            *flag = true;
+        });
+
+        cx.resources.spi.write(&msg.values).unwrap();
+
+        cx.resources.transfer_active.lock(|flag| {
+            *flag = false;
+        });
     }
 
     /// UART IRQ Handler just moves data from UART to/from tx/rx ring buffers
-    #[task(binds = USART2, priority = 4, resources = [uart, uart_rx_producer, uart_tx_consumer])]
-    fn uart2(cx: uart2::Context) {
+    #[task(binds = USART1, priority = 4, resources = [debugio, uart, uart_rx_producer, uart_tx_consumer])]
+    fn uart(cx: uart::Context) {
+        static mut OVFCOUNT: u32 = 0;
 
-        if cx.resources.uart.is_rxne() {
-            match cx.resources.uart.read() {
-                Ok(x) => cx.resources.uart_rx_producer.enqueue(x).expect("rx Overflow"),
-                Err(_) => (),
-            };
+        cx.resources.debugio.set_high();
+        // Try to read; it may return an error such as an ORE or WouldBlock if no data
+        // is available to read, but we have to read it every time we get an IRQ in
+        // order to ensure an ORE flag gets cleared
+        let result = cx.resources.uart.read();
+        match result {
+            Ok(x) => cx.resources.uart_rx_producer.enqueue(x).expect("Rx overflow"),
+            Err(_) => (),
         }
 
         if cx.resources.uart.is_txe() {
@@ -282,11 +297,13 @@ const APP: () = {
                 None => cx.resources.uart.unlisten(hal::serial::Event::Txe),
             }
         }
+        cx.resources.debugio.set_low();
     }
 
     // Interrupt handlers used by RTFM to dispatch software tasks
     extern "C" {
         fn TIM2();
+        fn TIM3();
     }
 };
 
