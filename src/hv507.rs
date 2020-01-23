@@ -5,6 +5,7 @@ use cortex_m::interrupt;
 use cortex_m::interrupt::Mutex;
 use cortex_m::asm;
 use cortex_m_semihosting::hprintln;
+use alloc::boxed::Box;
 
 const BLANKING_DELAY_NS: u64 = 3000;
 const RESET_DELAY_NS: u64 = 2000;
@@ -17,46 +18,48 @@ fn delay_ns(nanos: u64) {
     asm::delay(cycles as u32);
 }
 
-pub struct Hv507<SPI, ADC, AdcPin, BlOutputPin, PolOutputPin, LeOutputPin, IntResetOutputPin, AdcError> 
+pub struct Hv507<SPI, AdcOneShot, AdcPin, BlOutputPin, PolOutputPin, LeOutputPin, IntResetOutputPin> 
 // where AdcOneShot: OneShot<ADC, u16, AdcPin, Error=AdcError>.
 {
     /// Output GPIO to control polarity on HV507
     /// Low = inverted output, high = non-inverted
-    pol: RefCell<PolOutputPin>,
+    pol: Box<OutputPin<PushPull>>,
     /// Output GPIO to control blanking on HV507
     /// Low = blank (equivalent to setting all shift register bits 0)
-    bl: RefCell<BlOutputPin>,
+    bl: Box<OutputPin<PushPull>,
     /// Latch enable pin to latch shift register contents to output on HV507
-    le: RefCell<LeOutputPin>,
+    le: Box<OutputPin<PushPull>,
     /// Resets the integrator voltage when set high
-    int_reset: RefCell<IntResetOutputPin>,
+    int_reset: Box<Output,
     /// SPI bus for writing out to shift register
     spi: RefCell<SPI>,
     /// ADC for reading current sense
-    adc: RefCell<ADC>,
+    adc: RefCell<AdcOneShot>,
     //adc: RefCell<OneShot<ADC, u16, Channel, Error=AdcError>>,
     adc_channel: RefCell<AdcPin>,
 
     /// Flag indicates when a shift register transfer is in progress
     transfer_active: Mutex<Cell<bool>>,
+    _phantom_adc: core::marker::PhantomData<AdcOneShot>,
+    _phantom_adcpin: core::marker::PhantomData<AdcPin>,
 }
 
-impl <SPI, ADC, AdcPin, BlOutputPin, PolOutputPin, LeOutputPin, IntResetOutputPin, SpiError, PinError, AdcError> 
-Hv507<SPI, ADC, AdcPin, BlOutputPin, PolOutputPin, LeOutputPin, IntResetOutputPin, AdcError> 
+impl <SPI, AdcOneShot, ADC, AdcPin, BlOutputPin, PolOutputPin, LeOutputPin, IntResetOutputPin, SpiError, PinError, AdcError> 
+Hv507<SPI, AdcOneShot, AdcPin, BlOutputPin, PolOutputPin, LeOutputPin, IntResetOutputPin> 
 where
     SpiError: core::fmt::Debug,
     PinError: core::fmt::Debug,
     AdcError: core::fmt::Debug,
-    ADC: Adc<hal::stm32::ADC1, u16, AdcPin, Error = AdcError>,
+    AdcOneShot: emhal::adc::OneShot<ADC, u16, dyn emhal::adc::Channel<ADC, ID=u8>, Error = AdcError>,
     SPI: emhal::blocking::spi::Write<u8, Error = SpiError>,
-    AdcPin: emhal::adc::Channel<hal::stm32::ADC1, ID = u8>,
+    AdcPin: emhal::adc::Channel<ADC, ID = u8>,
     BlOutputPin: emhal::digital::v2::OutputPin<Error = PinError>,
     PolOutputPin: emhal::digital::v2::OutputPin<Error = PinError>,
     LeOutputPin: emhal::digital::v2::OutputPin<Error = PinError>,
     IntResetOutputPin: emhal::digital::v2::OutputPin<Error = PinError>,
 {
     pub fn new(spi: SPI, adc: AdcOneShot, adc_channel: AdcPin, bl: BlOutputPin, pol: PolOutputPin, le: LeOutputPin, int_reset: IntResetOutputPin) -> 
-        Hv507<SPI, AdcOneShot, AdcPin, BlOutputPin, PolOutputPin, LeOutputPin, IntResetOutputPin, AdcError> 
+        Hv507<SPI, AdcOneShot, AdcPin, BlOutputPin, PolOutputPin, LeOutputPin, IntResetOutputPin> 
     {
         Hv507 { 
             spi: RefCell::new(spi),
