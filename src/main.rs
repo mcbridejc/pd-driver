@@ -52,9 +52,9 @@ static ALLOCATOR: CortexMHeap = CortexMHeap::empty();
 const HEAP_SIZE: usize = 8192; // in bytes
 
 
-const BLANKING_DELAY_NS: u64 = 12000;
+const BLANKING_DELAY_NS: u64 = 14000;
 const RESET_DELAY_NS: u64 = 1000;
-const SAMPLE_DELAY_NS: u64 = 2000;
+const SAMPLE_DELAY_NS: u64 = 5000;
 
 
 #[inline(always)]
@@ -184,7 +184,7 @@ const APP: () = {
     }
 
 
-    #[task(priority=3, resources = [transfer_active, bl_pin, pol_pin, le_pin, int_reset_pin, adc, adc_channel, uart, uart_tx_producer], schedule=[drive])]
+    #[task(priority=3, resources = [debugio, transfer_active, bl_pin, pol_pin, le_pin, int_reset_pin, adc, adc_channel, uart, uart_tx_producer], schedule=[drive])]
     fn drive(mut cx: drive::Context) {
         static mut STATE: bool = false;
 
@@ -200,6 +200,7 @@ const APP: () = {
         // int_reset resets the analog integrator to a near-zero when driven high.
         // When low, the integrator is free to integrate the current pulse.
         if *STATE {
+            adc.configure_channel(adc_channel, adc::config::Sequence::One, adc::config::SampleTime::Cycles_3);
             bl_pin.set_low().ok();
             pol_pin.set_high().ok();
             if !*cx.resources.transfer_active {
@@ -211,13 +212,22 @@ const APP: () = {
             delay_ns(BLANKING_DELAY_NS);
             int_reset_pin.set_low().ok();
             delay_ns(RESET_DELAY_NS);
-            let sample0 = adc.read(adc_channel).unwrap();
-            //let sample0 = 0;
+            cx.resources.debugio.set_high();
+            adc.start_conversion();
+            adc.wait_for_conversion_sequence();
+            let sample0 = adc.current_sample();
+            //let sample0 = 0; // adc.read(adc_channel).unwrap();
+            cx.resources.debugio.set_low();
             bl_pin.set_high().ok();
             delay_ns(SAMPLE_DELAY_NS);
-            let sample1 = adc.read(adc_channel).unwrap();
-            int_reset_pin.set_high().ok();
+
+            cx.resources.debugio.set_high();
+            adc.start_conversion();
+            adc.wait_for_conversion_sequence();
+            let sample1 = adc.current_sample();
             //let sample1 = 100;
+            cx.resources.debugio.set_low();
+            int_reset_pin.set_high().ok();
             let msg = ActiveCapacitanceStruct{baseline: sample0, measurement: sample1};
             let buf: Vec<u8> = msg.into();
             for b in serialize(ACTIVE_CAPACITANCE_ID, &buf) {
@@ -277,11 +287,10 @@ const APP: () = {
     }
 
     /// UART IRQ Handler just moves data from UART to/from tx/rx ring buffers
-    #[task(binds = USART1, priority = 4, resources = [debugio, uart, uart_rx_producer, uart_tx_consumer])]
+    #[task(binds = USART1, priority = 4, resources = [uart, uart_rx_producer, uart_tx_consumer])]
     fn uart(cx: uart::Context) {
         static mut OVFCOUNT: u32 = 0;
 
-        cx.resources.debugio.set_high();
         // Try to read; it may return an error such as an ORE or WouldBlock if no data
         // is available to read, but we have to read it every time we get an IRQ in
         // order to ensure an ORE flag gets cleared
@@ -297,7 +306,6 @@ const APP: () = {
                 None => cx.resources.uart.unlisten(hal::serial::Event::Txe),
             }
         }
-        cx.resources.debugio.set_low();
     }
 
     // Interrupt handlers used by RTFM to dispatch software tasks
