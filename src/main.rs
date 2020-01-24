@@ -21,18 +21,15 @@ use alloc_cortex_m::CortexMHeap;
 extern crate alloc;
 use self::alloc::vec::Vec;
 use core::alloc::Layout;
-use core::fmt::Write;
 use cortex_m::{asm};
 use stm32f4xx_hal as hal;
 use stm32f4::stm32f411 as target_device;
-use target_device::Interrupt;
 
 use hal::prelude::*;
 use embedded_hal::digital::v2::{OutputPin};
-use embedded_hal::adc::{OneShot, Channel};
-use stm32f4xx_hal::gpio::{gpioa, gpiob, gpioc, gpiod, Output, PushPull, Analog, Alternate, AF5, AF7};
-use stm32f4xx_hal::spi;
+use stm32f4xx_hal::gpio::{gpioa, gpiob, gpioc, Output, PushPull, Analog, Alternate, AF5, AF7};
 use stm32f4xx_hal::adc;
+use stm32f4xx_hal::spi;
 use heapless::{
     i,
     spsc::{Consumer, Producer, Queue},
@@ -51,17 +48,23 @@ use pd_driver_messages::{
 static ALLOCATOR: CortexMHeap = CortexMHeap::empty();
 const HEAP_SIZE: usize = 8192; // in bytes
 
-
 const BLANKING_DELAY_NS: u64 = 14000;
 const RESET_DELAY_NS: u64 = 1000;
 const SAMPLE_DELAY_NS: u64 = 5000;
-
+const FULL_READ_PERIOD: u32 = 500;
+const N_PINS: usize = 128;
 
 #[inline(always)]
 fn delay_ns(nanos: u64) {
     const FCLK: u64 = 100_000_000;
     let cycles = (nanos * FCLK + 999_999_999) / 1_000_000_000;
     asm::delay(cycles as u32);
+}
+
+#[derive(Clone, Default)]
+pub struct ElectrodeState {
+    pins: [u8; N_PINS/8],
+    version: u32,
 }
 
 #[rtfm::app(device = stm32f4::stm32f411, peripherals = true, monotonic = rtfm::cyccnt::CYCCNT)]
@@ -86,6 +89,7 @@ const APP: () = {
         transfer_active: bool,
         parser: Parser,
         debugio: gpioc::PC0<Output<PushPull>>,
+        electrodes: ElectrodeState,
     }
 
     #[init(schedule = [drive])]
@@ -100,7 +104,6 @@ const APP: () = {
 
         // Device specific peripherals
         let device: target_device::Peripherals = cx.device;
-
 
         let stim = &mut core.ITM.stim[0];
         iprintln!(stim, "Running");
@@ -117,7 +120,7 @@ const APP: () = {
         let gpioa = device.GPIOA.split();
         let gpiob = device.GPIOB.split();
         let gpioc = device.GPIOC.split();
-        let gpiod = device.GPIOD.split();
+        let _gpiod = device.GPIOD.split();
         let tx_pin = gpioa.pa9.into_alternate_af7();
         let rx_pin = gpioa.pa10.into_alternate_af7();
         let mut uart = hal::serial::Serial::usart1(
@@ -165,6 +168,8 @@ const APP: () = {
 
         let parser = Parser::new();
 
+        let electrodes = ElectrodeState::default();
+
         init::LateResources {
             uart,
             uart_rx_producer,
@@ -180,14 +185,20 @@ const APP: () = {
             adc_channel,
             parser,
             debugio,
+            electrodes,
         }
     }
 
 
-    #[task(priority=3, resources = [debugio, transfer_active, bl_pin, pol_pin, le_pin, int_reset_pin, adc, adc_channel, uart, uart_tx_producer], schedule=[drive])]
+    #[task(priority=3, resources = [debugio, spi, electrodes, transfer_active, bl_pin, pol_pin, le_pin, int_reset_pin, adc, adc_channel, uart, uart_tx_producer], schedule=[drive])]
     fn drive(mut cx: drive::Context) {
-        static mut STATE: bool = false;
 
+        static mut STATE: bool = false;
+        static mut LAST_ELECTRODE_VERSION: u32 = 0xFFFF;
+        static mut LAST_SENT_PAGE: usize = 0;
+        static mut FULL_READ_COUNTER: u32 = 0;
+        static mut FULL_READ_DATA: [u16; N_PINS] = [0u16; N_PINS];
+        const PAGE_SIZE: usize = 4;
         let bl_pin = cx.resources.bl_pin;
         let pol_pin = cx.resources.pol_pin;
         let le_pin = cx.resources.le_pin;
@@ -195,7 +206,84 @@ const APP: () = {
         let adc = cx.resources.adc;
         let adc_channel = cx.resources.adc_channel;
 
-        // Drive the HV507b polarity switching sequence
+
+        // Every FULL_READ_PERIOD cycles, we do a scan of all electrodes
+        // The results are sent as pages in short messages interleaved with the
+        // active electrode measurements so that the large amount of data generated
+        // by the full read doesn't cause a bubble in the active electrode messages.
+        *FULL_READ_COUNTER += 1;
+        if *FULL_READ_COUNTER == FULL_READ_PERIOD {
+            // Clear all bits in the shift registers, except the first
+            for _ in 0..N_PINS/8 - 1 {
+                cx.resources.spi.write(&[0]).unwrap();
+            }
+            cx.resources.spi.write(&[1]).unwrap();
+            // Temporarily take over the SCLK pin
+            let peripherals = unsafe {hal::stm32::Peripherals::steal()};
+            let gpioa = peripherals.GPIOA.split();
+            let gpiob = peripherals.GPIOB.split();
+            let mut sckpin = gpioa.pa5.into_push_pull_output();
+            let mut mosipin = gpiob.pb5.into_push_pull_output();
+
+            pol_pin.set_high().ok();
+            bl_pin.set_low().ok();
+            mosipin.set_low().ok();
+            // Empirically, it is taking a long time for the current to settle here, and this
+            // delay is necessary to prevent excessive noise while sampling the first electrodes
+            // This needs more investigation.
+            delay_ns(200000);
+
+            for i in 0..N_PINS {
+                if N_PINS - 1 - i == 15 {
+                    // This pin is the top plate; skip it.
+                    sckpin.set_high().ok();
+                    delay_ns(80);
+                    sckpin.set_low().ok();
+                    continue;
+                }
+                int_reset_pin.set_low().ok();
+                delay_ns(RESET_DELAY_NS);
+
+                // Take the pre-pulse/baseline sample
+                adc.start_conversion();
+                adc.wait_for_conversion_sequence();
+                let sample0 = adc.current_sample();
+                bl_pin.set_high().ok();
+                delay_ns(SAMPLE_DELAY_NS);
+                // Measure integrator after current pulse
+                cx.resources.debugio.set_high().ok();
+                adc.start_conversion();
+                adc.wait_for_conversion_sequence();
+                let sample1 = adc.current_sample();
+                cx.resources.debugio.set_low().ok();
+
+                FULL_READ_DATA[N_PINS - 1 - i] = sample1 - sample0;
+                bl_pin.set_low().ok();
+                sckpin.set_high().ok();
+                int_reset_pin.set_high().ok();
+                delay_ns(80);
+                sckpin.set_low().ok();
+                le_pin.set_low().ok();
+                delay_ns(80);
+                le_pin.set_high().ok();
+                delay_ns(4000);
+            }
+
+            // Put it back into alternate function for the SPI controller
+            mosipin.into_alternate_af5();
+            sckpin.into_alternate_af5();
+            *FULL_READ_COUNTER = 0;
+            *LAST_SENT_PAGE = 0;
+            // Restore the active electrode settings
+            cx.resources.spi.write(&cx.resources.electrodes.pins).unwrap();
+            *LAST_ELECTRODE_VERSION = cx.resources.electrodes.version;
+        } else if cx.resources.electrodes.version != *LAST_ELECTRODE_VERSION {
+            // Write new shift register value if there is one (from serial messages)
+            cx.resources.spi.write(&cx.resources.electrodes.pins).unwrap();
+            *LAST_ELECTRODE_VERSION = cx.resources.electrodes.version;
+        }
+
+        // Drive the HV507 polarity switching sequence
         // On polarity rise, also measure the capacitance of the activated electrodes
         // int_reset resets the analog integrator to a near-zero when driven high.
         // When low, the integrator is free to integrate the current pulse.
@@ -212,21 +300,15 @@ const APP: () = {
             delay_ns(BLANKING_DELAY_NS);
             int_reset_pin.set_low().ok();
             delay_ns(RESET_DELAY_NS);
-            cx.resources.debugio.set_high();
             adc.start_conversion();
             adc.wait_for_conversion_sequence();
             let sample0 = adc.current_sample();
-            //let sample0 = 0; // adc.read(adc_channel).unwrap();
-            cx.resources.debugio.set_low();
             bl_pin.set_high().ok();
             delay_ns(SAMPLE_DELAY_NS);
 
-            cx.resources.debugio.set_high();
             adc.start_conversion();
             adc.wait_for_conversion_sequence();
             let sample1 = adc.current_sample();
-            //let sample1 = 100;
-            cx.resources.debugio.set_low();
             int_reset_pin.set_high().ok();
             let msg = ActiveCapacitanceStruct{baseline: sample0, measurement: sample1};
             let buf: Vec<u8> = msg.into();
@@ -240,6 +322,21 @@ const APP: () = {
             cx.resources.uart.lock(|uart| {
                 uart.listen(hal::serial::Event::Txe);
             });
+
+            if *LAST_SENT_PAGE + PAGE_SIZE <= N_PINS {
+                let start_index = *LAST_SENT_PAGE;
+                let mut values: Vec<u16> = Vec::new();
+                for i in start_index..start_index+PAGE_SIZE {
+                    values.push(FULL_READ_DATA[i]);
+                }
+                // Send the next page
+                let msg = BulkCapacitanceStruct{start_index: start_index as u8, values};
+                let buf: Vec<u8> = msg.into();
+                for b in serialize(BULK_CAPACITANCE_ID, &buf) {
+                    cx.resources.uart_tx_producer.enqueue(b).ok();
+                }
+                *LAST_SENT_PAGE += PAGE_SIZE;
+            }
             *STATE = false;
         } else {
             pol_pin.set_low().ok();
@@ -271,19 +368,17 @@ const APP: () = {
         }
     }
 
-    // Write new value to the HV507 shift register
-    // It is not latched until the next polarity rise event
-    #[task(priority=2, resources=[transfer_active, spi])]
+    #[task(priority=2, resources=[electrodes])]
     fn update_active_electrodes(mut cx: update_active_electrodes::Context, msg: ElectrodeEnableStruct) {
-        cx.resources.transfer_active.lock(|flag| {
-            *flag = true;
-        });
-
-        cx.resources.spi.write(&msg.values).unwrap();
-
-        cx.resources.transfer_active.lock(|flag| {
-            *flag = false;
-        });
+        // Store the new electrode settings in shared data structure, and increment the version
+        // The drive task will handle the SPI transfer, so that it can be synchronized with the
+        // rest of the HV507 control activity
+        cx.resources.electrodes.lock(|electrodes| {
+            for i in 0..N_PINS/8 {
+                electrodes.pins[i] = msg.values[i];
+            }
+            electrodes.version = (electrodes.version + 1) % 32768;
+        })
     }
 
     /// UART IRQ Handler just moves data from UART to/from tx/rx ring buffers
@@ -297,7 +392,7 @@ const APP: () = {
         let result = cx.resources.uart.read();
         match result {
             Ok(x) => cx.resources.uart_rx_producer.enqueue(x).expect("Rx overflow"),
-            Err(_) => (),
+            Err(_) => *OVFCOUNT += 1,
         }
 
         if cx.resources.uart.is_txe() {
