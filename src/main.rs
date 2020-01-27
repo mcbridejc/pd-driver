@@ -39,7 +39,7 @@ use typenum::consts::U512;
 
 use pd_driver_messages::{
     Parser,
-    serialize,
+    serialize_msg,
     messages::*
 };
 
@@ -67,13 +67,15 @@ pub struct ElectrodeState {
     version: u32,
 }
 
+type UARTTYPE = hal::serial::Serial<hal::stm32::USART1, (gpioa::PA9<Alternate<AF7>>, gpioa::PA10<Alternate<AF7>>)>;
+
 #[rtfm::app(device = stm32f4::stm32f411, peripherals = true, monotonic = rtfm::cyccnt::CYCCNT)]
 const APP: () = {
     struct Resources {
         // A resource
         //uart: hal::serial::Serial<hal::stm32::USART3, (gpiod::PD8<Alternate<AF7>>, gpiod::PD9<Alternate<AF7>>)>,
         //uart: hal::serial::Serial<hal::stm32::USART2, (gpioa::PA2<Alternate<AF7>>, gpioa::PA3<Alternate<AF7>>)>,
-        uart: hal::serial::Serial<hal::stm32::USART1, (gpioa::PA9<Alternate<AF7>>, gpioa::PA10<Alternate<AF7>>)>,
+        uart: UARTTYPE,
         uart_rx_producer: Producer<'static, u8, U512>,
         uart_rx_consumer: Consumer<'static, u8, U512>,
         uart_tx_producer: Producer<'static, u8, U512>,
@@ -276,11 +278,29 @@ const APP: () = {
             *LAST_SENT_PAGE = 0;
             // Restore the active electrode settings
             cx.resources.spi.write(&cx.resources.electrodes.pins).unwrap();
-            *LAST_ELECTRODE_VERSION = cx.resources.electrodes.version;
+            if *LAST_ELECTRODE_VERSION != cx.resources.electrodes.version {
+                *LAST_ELECTRODE_VERSION = cx.resources.electrodes.version;
+                let msg = ElectrodeAckStruct{};
+                for b in serialize_msg(&msg) {
+                    cx.resources.uart_tx_producer.enqueue(b).ok();
+                }
+                // Enable the TXE interrupt
+                cx.resources.uart.lock(|uart| {
+                    uart.listen(hal::serial::Event::Txe);
+                });
+            }
         } else if cx.resources.electrodes.version != *LAST_ELECTRODE_VERSION {
             // Write new shift register value if there is one (from serial messages)
             cx.resources.spi.write(&cx.resources.electrodes.pins).unwrap();
             *LAST_ELECTRODE_VERSION = cx.resources.electrodes.version;
+            let msg = ElectrodeAckStruct{};
+            for b in serialize_msg(&msg) {
+                cx.resources.uart_tx_producer.enqueue(b).ok();
+            }
+            // Enable the TXE interrupt
+            cx.resources.uart.lock(|uart| {
+                uart.listen(hal::serial::Event::Txe);
+            });
         }
 
         // Drive the HV507 polarity switching sequence
@@ -310,9 +330,11 @@ const APP: () = {
             adc.wait_for_conversion_sequence();
             let sample1 = adc.current_sample();
             int_reset_pin.set_high().ok();
+
+            // Send active capacitance message
             let msg = ActiveCapacitanceStruct{baseline: sample0, measurement: sample1};
-            let buf: Vec<u8> = msg.into();
-            for b in serialize(ACTIVE_CAPACITANCE_ID, &buf) {
+
+            for b in serialize_msg(&msg) {
                 match cx.resources.uart_tx_producer.enqueue(b) {
                     Ok(_) => (),
                     Err(_) => (),
@@ -331,8 +353,7 @@ const APP: () = {
                 }
                 // Send the next page
                 let msg = BulkCapacitanceStruct{start_index: start_index as u8, values};
-                let buf: Vec<u8> = msg.into();
-                for b in serialize(BULK_CAPACITANCE_ID, &buf) {
+                for b in serialize_msg(&msg) {
                     cx.resources.uart_tx_producer.enqueue(b).ok();
                 }
                 *LAST_SENT_PAGE += PAGE_SIZE;
@@ -382,7 +403,7 @@ const APP: () = {
     }
 
     /// UART IRQ Handler just moves data from UART to/from tx/rx ring buffers
-    #[task(binds = USART1, priority = 4, resources = [uart, uart_rx_producer, uart_tx_consumer])]
+    #[task(binds = EXTI1, priority = 4, resources = [uart, uart_rx_producer, uart_tx_consumer])]
     fn uart(cx: uart::Context) {
         static mut OVFCOUNT: u32 = 0;
 
