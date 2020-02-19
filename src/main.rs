@@ -67,6 +67,88 @@ pub struct ElectrodeState {
     version: u32,
 }
 
+enum PhaseState {
+    Off,
+    Forward,
+    Reverse,
+}
+
+pub struct Stepper<A1Pin, A2Pin, B1Pin, B2Pin>
+where
+    A1Pin: OutputPin,
+    A2Pin: OutputPin,
+    B1Pin: OutputPin,
+    B2Pin: OutputPin,
+{
+    a1: A1Pin,
+    a2: A2Pin,
+    b1: B1Pin,
+    b2: B2Pin,
+    pos: u8,
+    enabled: bool,
+}
+
+impl <A1Pin, A2Pin, B1Pin, B2Pin> Stepper<A1Pin, A2Pin, B1Pin, B2Pin>
+where
+    A1Pin: OutputPin,
+    A2Pin: OutputPin,
+    B1Pin: OutputPin,
+    B2Pin: OutputPin,
+{
+
+    pub fn new(a1: A1Pin, a2: A2Pin, b1: B1Pin, b2: B2Pin) -> Self {
+        Self {a1, a2, b1, b2, pos: 0, enabled: false}
+    }
+
+    pub fn step(&mut self, reverse: bool) {
+        if reverse {
+            self.pos = (self.pos - 1) % 4;
+        } else {
+            self.pos = (self.pos + 1) % 4;
+        }
+
+        if self.enabled {
+            self.set_output();
+        }
+    }
+
+    pub fn enable(&mut self) {
+        self.enabled = true;
+        self.set_output();
+    }
+
+    pub fn disable(&mut self) {
+        self.enabled = false;
+        self.set_phases((PhaseState::Off, PhaseState::Off));
+    }
+
+    fn set_output(&mut self) {
+        use PhaseState::*;
+        let phase_values = match self.pos {
+            0 => (Forward, Forward),
+            1 => (Forward, Reverse),
+            2 => (Reverse, Reverse),
+            3 => (Reverse, Forward),
+            _ => panic!("Invalid step value"),
+        };
+        self.set_phases(phase_values);
+    }
+
+    fn set_phases(&mut self, phase_values: (PhaseState, PhaseState)) {
+        use PhaseState::*;
+        match phase_values.0 {
+            Off => {self.a1.set_low().ok(); self.a2.set_low().ok();},
+            Forward => {self.a1.set_high().ok(); self.a2.set_low().ok();},
+            Reverse => {self.a1.set_low().ok(); self.a2.set_high().ok();},
+        }
+        match phase_values.1 {
+            Off => {self.b1.set_low().ok(); self.b2.set_low().ok();},
+            Forward => {self.b1.set_high().ok(); self.b2.set_low().ok();},
+            Reverse => {self.b1.set_low().ok(); self.b2.set_high().ok();},
+        }
+    }
+}
+
 type UARTTYPE = hal::serial::Serial<hal::stm32::USART1, (gpioa::PA9<Alternate<AF7>>, gpioa::PA10<Alternate<AF7>>)>;
 
 #[rtfm::app(device = stm32f4::stm32f411, peripherals = true, monotonic = rtfm::cyccnt::CYCCNT)]
@@ -92,6 +174,7 @@ const APP: () = {
         parser: Parser,
         debugio: gpioc::PC0<Output<PushPull>>,
         electrodes: ElectrodeState,
+        stepper: Stepper<gpiob::PB8<Output<PushPull>>, gpiob::PB9<Output<PushPull>>, gpioa::PA6<Output<PushPull>>, gpioa::PA7<Output<PushPull>>>,
     }
 
     #[init(schedule = [drive])]
@@ -162,15 +245,17 @@ const APP: () = {
         let now = cx.start; // the start time of the system
         cx.schedule.drive(now + 100_000_000u32.cycles()).unwrap();
 
-        hal::block!(uart.write(52)).unwrap();
-        hal::block!(uart.write(52)).unwrap();
-        hal::block!(uart.write(52)).unwrap();
-
         uart.listen(hal::serial::Event::Rxne);
 
         let parser = Parser::new();
 
         let electrodes = ElectrodeState::default();
+
+        let stepper_a1 = gpiob.pb8.into_push_pull_output();
+        let stepper_a2 = gpiob.pb9.into_push_pull_output();
+        let stepper_b1 = gpioa.pa6.into_push_pull_output();
+        let stepper_b2 = gpioa.pa7.into_push_pull_output();
+        let stepper = Stepper::new(stepper_a1, stepper_a2, stepper_b1, stepper_b2);
 
         init::LateResources {
             uart,
@@ -188,9 +273,46 @@ const APP: () = {
             parser,
             debugio,
             electrodes,
+            stepper,
         }
     }
 
+    #[task(priority=2, resources=[stepper, uart, uart_tx_producer], schedule=[move_stepper])]
+    fn move_stepper(mut cx: move_stepper::Context, msg: Option<MoveStepperStruct>) {
+        static mut STEPS_REMAINING: i16 = 0;
+        static mut PERIOD: u32 = 0;
+
+        if let Some(msg) = msg {
+            cx.resources.stepper.enable();
+            *STEPS_REMAINING = msg.steps;
+            *PERIOD = msg.period as u32;
+        }
+
+        if *STEPS_REMAINING == 0 {
+            cx.resources.stepper.disable();
+            let msg = CommandAckStruct{acked_id: ELECTRODE_ENABLE_ID};
+            let bytes = serialize_msg(&msg);
+            cx.resources.uart_tx_producer.lock(|q| {
+                for b in bytes {
+                    q.enqueue(b).unwrap();
+                }
+            });
+            // Enable the TXE interrupt
+            cx.resources.uart.lock(|uart| {
+                uart.listen(hal::serial::Event::Txe);
+            });
+        } else {
+            let reverse = if *STEPS_REMAINING < 0 {
+                *STEPS_REMAINING += 1;
+                true
+            } else {
+                *STEPS_REMAINING -= 1;
+                false
+            };
+            cx.resources.stepper.step(reverse);
+            cx.schedule.move_stepper(cx.scheduled + ((*PERIOD*10)).cycles(), None).unwrap();
+        }
+    }
 
     #[task(priority=3, resources = [debugio, spi, electrodes, transfer_active, bl_pin, pol_pin, le_pin, int_reset_pin, adc, adc_channel, uart, uart_tx_producer], schedule=[drive])]
     fn drive(mut cx: drive::Context) {
@@ -201,6 +323,7 @@ const APP: () = {
         static mut FULL_READ_COUNTER: u32 = 0;
         static mut FULL_READ_DATA: [u16; N_PINS] = [0u16; N_PINS];
         const PAGE_SIZE: usize = 4;
+        const ENABLE_POL: bool = true;
         let bl_pin = cx.resources.bl_pin;
         let pol_pin = cx.resources.pol_pin;
         let le_pin = cx.resources.le_pin;
@@ -276,13 +399,14 @@ const APP: () = {
             sckpin.into_alternate_af5();
             *FULL_READ_COUNTER = 0;
             *LAST_SENT_PAGE = 0;
+
             // Restore the active electrode settings
             cx.resources.spi.write(&cx.resources.electrodes.pins).unwrap();
             if *LAST_ELECTRODE_VERSION != cx.resources.electrodes.version {
                 *LAST_ELECTRODE_VERSION = cx.resources.electrodes.version;
-                let msg = ElectrodeAckStruct{};
+                let msg = CommandAckStruct{acked_id: ELECTRODE_ENABLE_ID};
                 for b in serialize_msg(&msg) {
-                    cx.resources.uart_tx_producer.enqueue(b).ok();
+                    cx.resources.uart_tx_producer.enqueue(b).unwrap();
                 }
                 // Enable the TXE interrupt
                 cx.resources.uart.lock(|uart| {
@@ -293,7 +417,7 @@ const APP: () = {
             // Write new shift register value if there is one (from serial messages)
             cx.resources.spi.write(&cx.resources.electrodes.pins).unwrap();
             *LAST_ELECTRODE_VERSION = cx.resources.electrodes.version;
-            let msg = ElectrodeAckStruct{};
+            let msg = CommandAckStruct{acked_id: ELECTRODE_ENABLE_ID};
             for b in serialize_msg(&msg) {
                 cx.resources.uart_tx_producer.enqueue(b).ok();
             }
@@ -307,61 +431,65 @@ const APP: () = {
         // On polarity rise, also measure the capacitance of the activated electrodes
         // int_reset resets the analog integrator to a near-zero when driven high.
         // When low, the integrator is free to integrate the current pulse.
-        if *STATE {
-            adc.configure_channel(adc_channel, adc::config::Sequence::One, adc::config::SampleTime::Cycles_3);
-            bl_pin.set_low().ok();
-            pol_pin.set_high().ok();
-            if !*cx.resources.transfer_active {
-                le_pin.set_low().ok();
-                delay_ns(80); // datasheet says 80ns min LE pulse width
-                le_pin.set_high().ok();
-            }
-
-            delay_ns(BLANKING_DELAY_NS);
-            int_reset_pin.set_low().ok();
-            delay_ns(RESET_DELAY_NS);
-            adc.start_conversion();
-            adc.wait_for_conversion_sequence();
-            let sample0 = adc.current_sample();
-            bl_pin.set_high().ok();
-            delay_ns(SAMPLE_DELAY_NS);
-
-            adc.start_conversion();
-            adc.wait_for_conversion_sequence();
-            let sample1 = adc.current_sample();
-            int_reset_pin.set_high().ok();
-
-            // Send active capacitance message
-            let msg = ActiveCapacitanceStruct{baseline: sample0, measurement: sample1};
-
-            for b in serialize_msg(&msg) {
-                match cx.resources.uart_tx_producer.enqueue(b) {
-                    Ok(_) => (),
-                    Err(_) => (),
+        if ENABLE_POL {
+            if *STATE {
+                adc.configure_channel(adc_channel, adc::config::Sequence::One, adc::config::SampleTime::Cycles_3);
+                bl_pin.set_low().ok();
+                pol_pin.set_high().ok();
+                if !*cx.resources.transfer_active {
+                    le_pin.set_low().ok();
+                    delay_ns(80); // datasheet says 80ns min LE pulse width
+                    le_pin.set_high().ok();
                 }
-            }
-            // Enable the TXE interrupt
-            cx.resources.uart.lock(|uart| {
-                uart.listen(hal::serial::Event::Txe);
-            });
 
-            if *LAST_SENT_PAGE + PAGE_SIZE <= N_PINS {
-                let start_index = *LAST_SENT_PAGE;
-                let mut values: Vec<u16> = Vec::new();
-                for i in start_index..start_index+PAGE_SIZE {
-                    values.push(FULL_READ_DATA[i]);
-                }
-                // Send the next page
-                let msg = BulkCapacitanceStruct{start_index: start_index as u8, values};
+                delay_ns(BLANKING_DELAY_NS);
+                int_reset_pin.set_low().ok();
+                delay_ns(RESET_DELAY_NS);
+                adc.start_conversion();
+                adc.wait_for_conversion_sequence();
+                let sample0 = adc.current_sample();
+                bl_pin.set_high().ok();
+                delay_ns(SAMPLE_DELAY_NS);
+
+                adc.start_conversion();
+                adc.wait_for_conversion_sequence();
+                let sample1 = adc.current_sample();
+                int_reset_pin.set_high().ok();
+
+                // Send active capacitance message
+                let msg = ActiveCapacitanceStruct{baseline: sample0, measurement: sample1};
                 for b in serialize_msg(&msg) {
-                    cx.resources.uart_tx_producer.enqueue(b).ok();
+                    match cx.resources.uart_tx_producer.enqueue(b) {
+                        Ok(_) => (),
+                        Err(_) => panic!("TX overflow"),
+                    }
                 }
-                *LAST_SENT_PAGE += PAGE_SIZE;
+                // Enable the TXE interrupt
+                cx.resources.uart.lock(|uart| {
+                    uart.listen(hal::serial::Event::Txe);
+                });
+
+                if *LAST_SENT_PAGE + PAGE_SIZE <= N_PINS {
+                    let start_index = *LAST_SENT_PAGE;
+                    let mut values: Vec<u16> = Vec::new();
+                    for i in start_index..start_index+PAGE_SIZE {
+                        values.push(FULL_READ_DATA[i]);
+                    }
+                    // Send the next page
+                    let msg = BulkCapacitanceStruct{start_index: start_index as u8, values};
+                    for b in serialize_msg(&msg) {
+                        cx.resources.uart_tx_producer.enqueue(b).unwrap();
+                    }
+                    *LAST_SENT_PAGE += PAGE_SIZE;
+                }
+                *STATE = false;
+            } else {
+                pol_pin.set_low().ok();
+                *STATE = true;
             }
-            *STATE = false;
         } else {
-            pol_pin.set_low().ok();
-            *STATE = true;
+            pol_pin.set_high().ok();
+            bl_pin.set_high().ok();
         }
 
         // Run every 1ms
@@ -369,20 +497,33 @@ const APP: () = {
     }
 
     /// The idle task handles parsing of incoming messages
-    #[idle(resources=[uart_rx_consumer, parser], spawn = [update_active_electrodes])]
+    #[idle(resources=[uart_rx_consumer, parser], spawn = [update_active_electrodes, move_stepper])]
     fn idle(cx: idle::Context) -> ! {
+        static mut PARSE_ERROR_COUNT: u32 = 0;
+
         let parser = cx.resources.parser;
         loop {
             match cx.resources.uart_rx_consumer.dequeue() {
                 Some(x) => {
-                    if let Some(msg) = parser.parse(x) {
-                        match msg {
-                            Message::ElectrodeEnableMsg(msg) => {
-                                cx.spawn.update_active_electrodes(msg).unwrap();
-                            },
-                            _ => (),
-                        }
+                    match parser.parse(x) {
+                        Ok(result) => {
+                            if let Some(msg) = result {
+                                match msg {
+                                    Message::ElectrodeEnableMsg(msg) => {
+                                        cx.spawn.update_active_electrodes(msg).unwrap();
+                                    },
+                                    Message::MoveStepperMsg(msg) => {
+                                        cx.spawn.move_stepper(Some(msg)).ok();
+                                    },
+                                    _ => (),
+                                }
+                            }
+                        },
+                        Err(_) => *PARSE_ERROR_COUNT += 1,
+
+
                     }
+
                 },
                 None => (),
             };
@@ -403,7 +544,7 @@ const APP: () = {
     }
 
     /// UART IRQ Handler just moves data from UART to/from tx/rx ring buffers
-    #[task(binds = EXTI1, priority = 4, resources = [uart, uart_rx_producer, uart_tx_consumer])]
+    #[task(binds = USART1, priority = 4, resources = [uart, uart_rx_producer, uart_tx_consumer])]
     fn uart(cx: uart::Context) {
         static mut OVFCOUNT: u32 = 0;
 
